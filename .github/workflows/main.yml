@@ -1,0 +1,160 @@
+name: RDP
+
+on:
+  workflow_dispatch:
+    inputs:
+      rdp_password:
+        description: "RDP password for ZYELEOS"
+        required: false
+        default: "ZYELEOS"
+        type: string
+
+jobs:
+  secure-rdp:
+    runs-on: windows-latest
+    timeout-minutes: 3600
+
+    steps:
+      - name: Configure RDP
+        shell: pwsh
+        run: |
+          Set-ItemProperty -Path 'HKLM:\System\CurrentControlSet\Control\Terminal Server' `
+            -Name "fDenyTSConnections" -Value 0 -Force
+
+          Set-ItemProperty -Path 'HKLM:\System\CurrentControlSet\Control\Terminal Server\WinStations\RDP-Tcp' `
+            -Name "UserAuthentication" -Value 1 -Force
+
+          Enable-NetFirewallRule -DisplayGroup "Remote Desktop"
+          Restart-Service -Name TermService -Force -ErrorAction SilentlyContinue
+
+      - name: Configure Runner Admin Password
+        shell: pwsh
+        run: |
+          $user   = "ZYELEOS"
+          $raw    = "${{ inputs.rdp_password }}"
+          $secure = ConvertTo-SecureString $raw -AsPlainText -Force
+
+          if (-not (Get-LocalUser -Name $user -ErrorAction SilentlyContinue)) {
+            New-LocalUser -Name $user -Password $secure -PasswordNeverExpires -AccountNeverExpires | Out-Null
+          } else {
+            Set-LocalUser -Name $user -Password $secure
+          }
+
+          Add-LocalGroupMember -Group "Administrators" -Member $user -ErrorAction SilentlyContinue
+
+      - name: Harden Session Against Suspend
+        shell: pwsh
+        run: |
+          powercfg -change -monitor-timeout-ac 0
+          powercfg -change -monitor-timeout-dc 0
+          powercfg -change -standby-timeout-ac 0
+          powercfg -change -standby-timeout-dc 0
+          powercfg -change -hibernate-timeout-ac 0
+          powercfg -change -hibernate-timeout-dc 0
+          powercfg -change -disk-timeout-ac 0
+          powercfg -change -disk-timeout-dc 0
+
+          $ts = "HKLM:\SOFTWARE\Policies\Microsoft\Windows NT\Terminal Services"
+          if (-not (Test-Path $ts)) { New-Item -Path $ts -Force | Out-Null }
+          Set-ItemProperty -Path $ts -Name "MaxIdleTime"          -Value 0 -Type DWord -Force
+          Set-ItemProperty -Path $ts -Name "MaxDisconnectionTime" -Value 0 -Type DWord -Force
+          Set-ItemProperty -Path $ts -Name "MaxConnectionTime"    -Value 0 -Type DWord -Force
+          Set-ItemProperty -Path $ts -Name "fResetBroken"         -Value 0 -Type DWord -Force
+          Set-ItemProperty -Path $ts -Name "KeepAliveEnable"      -Value 1 -Type DWord -Force
+          Set-ItemProperty -Path $ts -Name "KeepAliveInterval"    -Value 1 -Type DWord -Force
+
+          New-Item -Path "HKLM:\SOFTWARE\Policies\Microsoft\Windows\Personalization" -Force -ErrorAction SilentlyContinue | Out-Null
+          Set-ItemProperty -Path "HKLM:\SOFTWARE\Policies\Microsoft\Windows\Personalization" `
+            -Name "NoLockScreen" -Value 1 -Type DWord -Force
+
+          Set-ItemProperty -Path "HKCU:\Control Panel\Desktop" -Name "ScreenSaveActive" -Value "0" -Force
+          Set-ItemProperty -Path "HKCU:\Control Panel\Desktop" -Name "ScreenSaveTimeOut" -Value "0" -Force
+
+          Set-ItemProperty -Path "HKLM:\SYSTEM\CurrentControlSet\Control\Power" `
+            -Name "HibernateEnabled" -Value 0 -Type DWord -Force
+
+          Write-Host "Power + RDP session hardening applied."
+
+      - name: Install Roblox
+        shell: pwsh
+        run: |
+          $installer = "$env:TEMP\RobloxPlayerInstaller.exe"
+          Invoke-WebRequest -Uri "https://setup.rbxcdn.com/RobloxPlayerInstaller.exe" -OutFile $installer
+          Start-Process -FilePath $installer -ArgumentList "-silent" -Wait
+          Start-Sleep -Seconds 30
+
+          $studio = "$env:TEMP\RobloxStudioInstaller.exe"
+          Invoke-WebRequest -Uri "https://setup.rbxcdn.com/RobloxStudioInstaller.exe" -OutFile $studio
+          Start-Process -FilePath $studio -ArgumentList "-silent" -Wait
+          Start-Sleep -Seconds 30
+
+          Remove-Item $installer, $studio -Force -ErrorAction SilentlyContinue
+          Write-Host "Roblox Player + Studio installed."
+
+      - name: Install Tailscale
+        shell: pwsh
+        run: |
+          $installer = "$env:TEMP\tailscale.msi"
+          Invoke-WebRequest -Uri "https://pkgs.tailscale.com/stable/tailscale-setup-1.82.0-amd64.msi" -OutFile $installer
+          Start-Process msiexec.exe -ArgumentList "/i", "`"$installer`"", "/quiet", "/norestart" -Wait
+          Remove-Item $installer -Force
+
+      - name: Connect Tailscale
+        shell: pwsh
+        env:
+          TAILSCALE_AUTH_KEY: ${{ secrets.TAILSCALE_AUTH_KEY }}
+        run: |
+          $tailscale = "$env:ProgramFiles\Tailscale\tailscale.exe"
+          & $tailscale up --authkey="$env:TAILSCALE_AUTH_KEY" --hostname="infinite-rdp-$env:GITHUB_RUN_ID" --accept-routes
+
+          $tsIP = $null
+          for ($i = 1; $i -le 12; $i++) {
+            Start-Sleep -Seconds 5
+            $tsIP = (& $tailscale ip -4 2>$null | Select-Object -First 1).Trim()
+            if ($tsIP) { break }
+          }
+
+          if (-not $tsIP) { Write-Error "Tailscale IP was not assigned."; exit 1 }
+          "TAILSCALE_IP=$tsIP" >> $env:GITHUB_ENV
+
+      - name: Verify RDP
+        shell: pwsh
+        run: |
+          $result = Test-NetConnection -ComputerName $env:TAILSCALE_IP -Port 3389 -InformationLevel Quiet
+          if (-not $result) { Write-Error "RDP port 3389 is not reachable."; exit 1 }
+          Write-Host "RDP connection is ready."
+
+      - name: Show RDP Details
+        shell: pwsh
+        run: |
+          Write-Host ""
+          Write-Host "========================================"
+          Write-Host "       INFINITE RDP - TAILSCALE"
+          Write-Host "========================================"
+          Write-Host "Address  : $env:TAILSCALE_IP"
+          Write-Host "Username : ZYELEOS"
+          Write-Host "Password : ${{ inputs.rdp_password }}"
+          Write-Host "========================================"
+          Write-Host ""
+
+      - name: Keep RDP Alive
+        shell: pwsh
+        run: |
+          $jiggler = @'
+Add-Type -AssemblyName System.Windows.Forms
+while ($true) {
+    $p = [System.Windows.Forms.Cursor]::Position
+    [System.Windows.Forms.Cursor]::Position = New-Object System.Windows.Forms.Point(($p.X + 1), $p.Y)
+    Start-Sleep -Milliseconds 200
+    [System.Windows.Forms.Cursor]::Position = New-Object System.Windows.Forms.Point($p.X, $p.Y)
+    Start-Sleep -Seconds 30
+}
+'@
+          $jigglerPath = "$env:TEMP\jiggler.ps1"
+          Set-Content -Path $jigglerPath -Value $jiggler -Force
+          Start-Process pwsh -ArgumentList "-NoProfile","-WindowStyle","Hidden","-File",$jigglerPath -WindowStyle Hidden
+
+          while ($true) {
+            Write-Host "[$(Get-Date)] INFINITE RDP is active."
+            Start-Sleep -Seconds 300
+          }
